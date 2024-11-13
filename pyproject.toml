@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "serverless-web-crawler-workshop"
+version = "0.1.0"
+description = ""
+authors = ["sh1un <a0923183408@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "~3.11"
+boto3 = "^1.35.57"
+requests = "^2.32.3"
+beautifulsoup4 = "^4.12.3"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
