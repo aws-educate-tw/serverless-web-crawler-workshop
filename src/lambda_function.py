@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import boto3
 import requests
@@ -151,12 +151,6 @@ def get_question_content(question_url: str) -> Optional[str]:
 def fetch_questions(url: str) -> List[Dict[str, Any]]:
     """
     Fetch questions from AWS re:Post
-
-    Args:
-        url (str): The URL to fetch questions from
-
-    Returns:
-        List[Dict[str, Any]]: List of questions with their details
     """
     try:
         logger.info("Fetching questions from %s", url)
@@ -193,7 +187,7 @@ def fetch_questions(url: str) -> List[Dict[str, Any]]:
                     timestamp_element.text.strip() if timestamp_element else None
                 )
 
-                # Updated tag extraction with correct class names
+                # Get tags
                 tag_elements = question.find_all(
                     "span",
                     class_=[
@@ -204,26 +198,26 @@ def fetch_questions(url: str) -> List[Dict[str, Any]]:
                 )
                 tags = []
                 for tag in tag_elements:
-                    # 避免把"已接受的解答"標籤算進去
                     if "CustomTag_accepted__VKlHK" not in tag.get("class", []):
                         tag_text = tag.text.strip()
                         if tag_text:
                             tags.append(tag_text)
 
-                # Get vote count and view count if available
-                vote_count_element = question.find(
-                    "span", class_="QuestionCard_voteCount__DOYYL"
-                )
-                view_count_element = question.find(
-                    "span", class_="QuestionCard_viewCount__lOPE5"
+                # Get statistics (votes, views, answers)
+                stats_elements = question.find_all(
+                    "div", class_="AnswersVotesViews_count__9rLX_"
                 )
 
-                vote_count = (
-                    vote_count_element.text.strip() if vote_count_element else "0"
-                )
-                view_count = (
-                    view_count_element.text.strip() if view_count_element else "0"
-                )
+                # Initialize default values
+                answers_count = "0"
+                vote_count = "0"
+                view_count = "0"
+
+                # Usually the order is: answers, votes, views
+                if stats_elements and len(stats_elements) >= 3:
+                    answers_count = stats_elements[0].text.strip()
+                    vote_count = stats_elements[1].text.strip()
+                    view_count = stats_elements[2].text.strip()
 
                 # Create structured question data
                 question_data = {
@@ -233,14 +227,19 @@ def fetch_questions(url: str) -> List[Dict[str, Any]]:
                     "tags": tags,
                     "timestamp": timestamp,
                     "language": "zh-Hant" if "/zh-Hant/" in url else "en",
-                    "vote_count": vote_count,
-                    "view_count": view_count,
+                    "answers_count": int(answers_count),
+                    "vote_count": int(vote_count),
+                    "view_count": int(view_count),
                     "crawled_at": datetime.now(timezone.utc).isoformat(),
                 }
 
                 processed_questions.append(question_data)
                 logger.debug(
-                    "Processed question: %s with tags: %s", question_text, tags
+                    "Processed question: %s with stats: %s answers, %s votes, %s views",
+                    question_text,
+                    answers_count,
+                    vote_count,
+                    view_count,
                 )
 
             except Exception as e:
@@ -262,19 +261,88 @@ def fetch_questions(url: str) -> List[Dict[str, Any]]:
         return []
 
 
-def save_to_s3(questions: List[Dict[str, Any]]) -> bool:
+def update_execution_log(execution_info: Dict[str, Any]) -> bool:
+    """
+    Update the crawler execution log in S3
+
+    Args:
+        execution_info (Dict[str, Any]): Information about the current execution
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Log file path
+        log_file = f"{S3_PREFIX}crawler_execution_log.json"
+
+        # Try to get existing log
+        try:
+            response = s3_client.get_object(Bucket=S3_BUCKET, Key=log_file)
+            log_data = json.loads(response["Body"].read().decode("utf-8"))
+            executions = log_data.get("executions", [])
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                executions = []
+            else:
+                raise
+
+        # Add new execution record
+        executions.append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "questions_processed": execution_info["total_questions"],
+                "english_questions": execution_info["english_questions"],
+                "chinese_questions": execution_info["chinese_questions"],
+                "output_file": execution_info["output_file"],
+                "status": execution_info["status"],
+                "error_message": execution_info.get("error_message"),
+                "duration_ms": execution_info.get("duration_ms"),
+            }
+        )
+
+        # Keep only the last 1000 executions
+        if len(executions) > 1000:
+            executions = executions[-1000:]
+
+        # Create updated log data
+        log_data = {
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "total_executions": len(executions),
+            "executions": executions,
+        }
+
+        # Save updated log
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=log_file,
+            Body=json.dumps(log_data, ensure_ascii=False, indent=2),
+            ContentType="application/json",
+        )
+
+        logger.info("Successfully updated execution log")
+        return True
+
+    except Exception as e:
+        logger.error("Error updating execution log: %s", str(e))
+        return False
+
+
+def save_to_s3(
+    questions: List[Dict[str, Any]], start_time: datetime
+) -> Tuple[bool, str]:
     """
     Save questions data to S3 in JSON format
 
     Args:
         questions (List[Dict[str, Any]]): List of question data to save
+        start_time (datetime): Execution start time
 
     Returns:
-        bool: True if successful, False otherwise
+        Tuple[bool, str]: (Success status, Output filename)
     """
     if not questions:
         logger.warning("No questions to save")
-        return False
+        return False, ""
 
     try:
         # Create filename with timestamp
@@ -293,6 +361,9 @@ def save_to_s3(questions: List[Dict[str, Any]]) -> bool:
             ),
             "questions_with_accepted_answers": sum(
                 1 for q in questions if q.get("has_accepted_answer", False)
+            ),
+            "execution_duration_ms": int(
+                (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             ),
         }
 
@@ -313,11 +384,11 @@ def save_to_s3(questions: List[Dict[str, Any]]) -> bool:
             S3_BUCKET,
             filename,
         )
-        return True
+        return True, filename
 
     except Exception as e:
         logger.error("Unexpected error saving to S3: %s", str(e))
-        return False
+        return False, ""
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -331,6 +402,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Lambda response
     """
+    start_time = datetime.now(timezone.utc)
+
     try:
         logger.info("Starting Lambda execution")
 
@@ -342,7 +415,23 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         all_questions = questions_en + questions_zh
 
         # Save to S3
-        if save_to_s3(all_questions):
+        success, output_file = save_to_s3(all_questions, start_time)
+
+        execution_info = {
+            "total_questions": len(all_questions),
+            "english_questions": len(questions_en),
+            "chinese_questions": len(questions_zh),
+            "output_file": output_file,
+            "status": "success" if success else "error",
+            "duration_ms": int(
+                (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            ),
+        }
+
+        # Update execution log
+        update_execution_log(execution_info)
+
+        if success:
             return {
                 "statusCode": 200,
                 "body": json.dumps(
@@ -351,7 +440,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "total_questions": len(all_questions),
                         "english_questions": len(questions_en),
                         "chinese_questions": len(questions_zh),
+                        "output_file": output_file,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "duration_ms": execution_info["duration_ms"],
                     }
                 ),
             }
@@ -362,8 +453,26 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }
 
     except Exception as e:
-        logger.error("Unexpected error in lambda_handler: %s", str(e))
+        error_message = str(e)
+        logger.error("Unexpected error in lambda_handler: %s", error_message)
+
+        # Update execution log with error
+        execution_info = {
+            "total_questions": 0,
+            "english_questions": 0,
+            "chinese_questions": 0,
+            "output_file": "",
+            "status": "error",
+            "error_message": error_message,
+            "duration_ms": int(
+                (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            ),
+        }
+        update_execution_log(execution_info)
+
         return {
             "statusCode": 500,
-            "body": json.dumps({"error": "Internal server error", "message": str(e)}),
+            "body": json.dumps(
+                {"error": "Internal server error", "message": error_message}
+            ),
         }
