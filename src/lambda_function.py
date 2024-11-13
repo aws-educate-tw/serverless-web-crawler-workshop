@@ -122,7 +122,7 @@ def identify_question_types(text: str) -> Set[str]:
     return found_types
 
 
-def get_question_content(question_url: str) -> Optional[str]:
+def get_question_content(question_url: str) -> Optional[Dict[str, Any]]:
     """
     Fetch the full content of a question
 
@@ -130,16 +130,38 @@ def get_question_content(question_url: str) -> Optional[str]:
         question_url (str): URL of the question
 
     Returns:
-        Optional[str]: Question content if successful, None otherwise
+        Optional[Dict[str, Any]]: Question details if successful, None otherwise
     """
     try:
+        logger.info("Fetching question content from %s", question_url)
         response = requests.get(question_url, headers=headers, timeout=10)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, "html.parser")
-        content_div = soup.find("div", class_="QuestionPage_content__")
 
-        return content_div.text.strip() if content_div else None
+        # Get question description
+        description = None
+
+        # Try to find the description content
+        description_div = soup.find("div", {"data-test": "question-description"})
+        if description_div:
+            # Find paragraphs within the custom-md-style div
+            content_div = description_div.find("div", class_="custom-md-style")
+            if content_div:
+                # Get the text of all paragraphs
+                paragraphs = content_div.find_all("p")
+                description = "\n".join(p.text.strip() for p in paragraphs)
+                if not description:
+                    # If no paragraphs are found, directly get the text of the div
+                    description = content_div.text.strip()
+
+        if not description:
+            logger.warning("No description found for question: %s", question_url)
+
+        return {
+            "description": description,
+            "crawled_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     except Exception as e:
         logger.error(
@@ -219,10 +241,13 @@ def fetch_questions(url: str) -> List[Dict[str, Any]]:
                     vote_count = stats_elements[1].text.strip()
                     view_count = stats_elements[2].text.strip()
 
-                # Create structured question data
+                # Get detailed question content
+                question_details = get_question_content(question_url)
+
+                # Create base question data
                 question_data = {
                     "url": question_url,
-                    "text": question_text,
+                    "title": question_text,
                     "has_accepted_answer": question_accepted_tag is not None,
                     "tags": tags,
                     "timestamp": timestamp,
@@ -233,13 +258,19 @@ def fetch_questions(url: str) -> List[Dict[str, Any]]:
                     "crawled_at": datetime.now(timezone.utc).isoformat(),
                 }
 
+                # Add description if available
+                if question_details and question_details.get("description"):
+                    question_data["description"] = question_details["description"]
+
                 processed_questions.append(question_data)
                 logger.debug(
-                    "Processed question: %s with stats: %s answers, %s votes, %s views",
+                    "Processed question: %s with description length: %s",
                     question_text,
-                    answers_count,
-                    vote_count,
-                    view_count,
+                    (
+                        len(question_details.get("description", ""))
+                        if question_details
+                        else 0
+                    ),
                 )
 
             except Exception as e:
