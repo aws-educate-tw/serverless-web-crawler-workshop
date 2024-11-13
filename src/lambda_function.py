@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 
 import boto3
 import requests
@@ -16,6 +16,54 @@ logger.setLevel(logging.INFO)
 # Constants
 REPOST_URL = "https://repost.aws/questions?view=all&sort=recent"
 REPOST_URL_ZH = "https://repost.aws/zh-Hant/questions?view=all&sort=recent"
+
+# AWS Service Categories
+AWS_SERVICES = {
+    "compute": {
+        "ec2",
+        "lambda",
+        "ecs",
+        "eks",
+        "fargate",
+        "batch",
+        "lightsail",
+        "elastic-beanstalk",
+    },
+    "storage": {"s3", "ebs", "efs", "fsx", "storage-gateway"},
+    "database": {"rds", "dynamodb", "aurora", "redshift", "documentdb", "elasticache"},
+    "networking": {"vpc", "route53", "cloudfront", "api-gateway", "direct-connect"},
+    "security": {"iam", "cognito", "kms", "waf", "shield", "security-hub"},
+    "analytics": {"athena", "emr", "elasticsearch", "kinesis", "quicksight"},
+    "integration": {"sns", "sqs", "eventbridge", "step-functions"},
+    "management": {"cloudwatch", "cloudformation", "organizations", "systems-manager"},
+    "developer-tools": {"codecommit", "codebuild", "codedeploy", "codepipeline"},
+    "machine-learning": {"sagemaker", "comprehend", "rekognition", "polly", "textract"},
+}
+
+# Question Type Patterns
+QUESTION_TYPES = {
+    "error": {"error", "exception", "failed", "trouble", "issue", "problem", "debug"},
+    "how_to": {"how to", "how do i", "way to", "guide", "tutorial"},
+    "best_practice": {
+        "best practice",
+        "recommend",
+        "optimal",
+        "better way",
+        "improvement",
+    },
+    "comparison": {"vs", "versus", "compare", "difference between", "choose between"},
+    "configuration": {"configure", "setup", "setting", "configuration", "parameter"},
+    "performance": {
+        "performance",
+        "optimization",
+        "slow",
+        "faster",
+        "latency",
+        "throughput",
+    },
+    "cost": {"cost", "pricing", "bill", "expense", "budget"},
+    "security": {"security", "permission", "access", "authentication", "authorization"},
+}
 
 # Environment variables
 S3_BUCKET = os.environ["S3_BUCKET"]
@@ -31,6 +79,73 @@ except Exception as e:
 
 # HTTP Headers
 headers = {"User-Agent": USER_AGENT}
+
+
+def categorize_aws_services(tags: List[str], text: str) -> Set[str]:
+    """
+    Categorize AWS services mentioned in tags and text
+
+    Args:
+        tags (List[str]): List of question tags
+        text (str): Question text
+
+    Returns:
+        Set[str]: Set of AWS service categories
+    """
+    found_categories = set()
+    combined_text = " ".join(tags + [text.lower()])
+
+    for category, services in AWS_SERVICES.items():
+        if any(service in combined_text for service in services):
+            found_categories.add(category)
+
+    return found_categories
+
+
+def identify_question_types(text: str) -> Set[str]:
+    """
+    Identify question types based on text patterns
+
+    Args:
+        text (str): Question text
+
+    Returns:
+        Set[str]: Set of identified question types
+    """
+    found_types = set()
+    text_lower = text.lower()
+
+    for qtype, patterns in QUESTION_TYPES.items():
+        if any(pattern in text_lower for pattern in patterns):
+            found_types.add(qtype)
+
+    return found_types
+
+
+def get_question_content(question_url: str) -> Optional[str]:
+    """
+    Fetch the full content of a question
+
+    Args:
+        question_url (str): URL of the question
+
+    Returns:
+        Optional[str]: Question content if successful, None otherwise
+    """
+    try:
+        response = requests.get(question_url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        content_div = soup.find("div", class_="QuestionPage_content__")
+
+        return content_div.text.strip() if content_div else None
+
+    except Exception as e:
+        logger.error(
+            "Error fetching question content from %s: %s", question_url, str(e)
+        )
+        return None
 
 
 def fetch_questions(url: str) -> List[Dict[str, Any]]:
@@ -78,14 +193,22 @@ def fetch_questions(url: str) -> List[Dict[str, Any]]:
                     timestamp_element.text.strip() if timestamp_element else None
                 )
 
-                # Get tags if available
-                tags_container = question.find(
-                    "div", class_="QuestionCard_tagContainer__hXXd5"
+                # Updated tag extraction with correct class names
+                tag_elements = question.find_all(
+                    "span",
+                    class_=[
+                        "ant-tag",
+                        "NavigableTag_tag__BmXT_",
+                        "CustomTag_tag__kXm6J",
+                    ],
                 )
                 tags = []
-                if tags_container:
-                    tag_elements = tags_container.find_all("span", class_="ant-tag")
-                    tags = [tag.text.strip() for tag in tag_elements if tag]
+                for tag in tag_elements:
+                    # 避免把"已接受的解答"標籤算進去
+                    if "CustomTag_accepted__VKlHK" not in tag.get("class", []):
+                        tag_text = tag.text.strip()
+                        if tag_text:
+                            tags.append(tag_text)
 
                 # Get vote count and view count if available
                 vote_count_element = question.find(
@@ -116,7 +239,9 @@ def fetch_questions(url: str) -> List[Dict[str, Any]]:
                 }
 
                 processed_questions.append(question_data)
-                logger.debug("Processed question: %s", question_text)
+                logger.debug(
+                    "Processed question: %s with tags: %s", question_text, tags
+                )
 
             except Exception as e:
                 logger.error("Error processing individual question: %s", str(e))
@@ -161,6 +286,14 @@ def save_to_s3(questions: List[Dict[str, Any]]) -> bool:
             "question_count": len(questions),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "source_urls": [REPOST_URL, REPOST_URL_ZH],
+            "en_count": sum(1 for q in questions if q["language"] == "en"),
+            "zh_count": sum(1 for q in questions if q["language"] == "zh-Hant"),
+            "tags": list(
+                set(tag for question in questions for tag in question.get("tags", []))
+            ),
+            "questions_with_accepted_answers": sum(
+                1 for q in questions if q.get("has_accepted_answer", False)
+            ),
         }
 
         # Create final data structure
@@ -182,9 +315,6 @@ def save_to_s3(questions: List[Dict[str, Any]]) -> bool:
         )
         return True
 
-    except ClientError as e:
-        logger.error("Error saving to S3: %s", str(e))
-        return False
     except Exception as e:
         logger.error("Unexpected error saving to S3: %s", str(e))
         return False
