@@ -4,7 +4,7 @@ from typing import Dict
 import mysql.connector
 from mysql.connector import pooling
 
-from src.exceptions import DatabaseConnectionError
+from exceptions import DatabaseConnectionError
 
 # Database configuration from Lambda environment variables
 DB_CONFIG: Dict = {

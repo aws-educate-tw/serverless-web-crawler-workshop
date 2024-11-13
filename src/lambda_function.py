@@ -9,6 +9,14 @@ import requests
 from botocore.exceptions import ClientError
 from bs4 import BeautifulSoup
 
+from config.database import get_connection_pool
+from repositories import (
+    CrawlerExecutionsRepository,
+    QuestionsRepository,
+    QuestionTagsRepository,
+    TagsRepository,
+)
+
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -73,12 +81,54 @@ USER_AGENT = os.environ["USER_AGENT"]
 # Initialize S3 client
 try:
     s3_client = boto3.client("s3")
+    # Initialize repositories
+    pool = get_connection_pool()
+    questions_repo = QuestionsRepository(pool)
+    tags_repo = TagsRepository(pool)
+    question_tags_repo = QuestionTagsRepository(pool)
+    crawler_executions_repo = CrawlerExecutionsRepository(pool)
 except Exception as e:
-    logger.error("Failed to initialize AWS client: %s", str(e))
+    logger.error("Failed to initialize clients: %s", str(e))
     raise
 
 # HTTP Headers
 headers = {"User-Agent": USER_AGENT}
+
+
+def process_question(question_data: Dict[str, Any]) -> Tuple[bool, Optional[int]]:
+    """
+    Process a single question and save to database
+
+    Args:
+        question_data: Question data dictionary
+
+    Returns:
+        Tuple of (success status, question ID if successful)
+    """
+    try:
+        # Create or update question
+        question_id = questions_repo.create_or_update(question_data)
+        if not question_id:
+            return False, None
+
+        # Process tags
+        if question_data.get("tags"):
+            # Create or get tag IDs
+            tag_ids = []
+            for tag_name in question_data["tags"]:
+                tag_id = tags_repo.create_or_get(tag_name)
+                if tag_id:
+                    tag_ids.append(tag_id)
+
+            # Update question tags
+            if tag_ids:
+                question_tags_repo.update_question_tags(question_id, set(tag_ids))
+
+        return True, question_id
+
+    except Exception as e:
+        logger.error("Error processing question data: %s", str(e))
+        return False, None
 
 
 def categorize_aws_services(tags: List[str], text: str) -> Set[str]:
@@ -427,11 +477,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Main Lambda handler function
 
     Args:
-        event (Dict[str, Any]): Lambda event
-        context (Any): Lambda context
+        event: Lambda event
+        context: Lambda context
 
     Returns:
-        Dict[str, Any]: Lambda response
+        Lambda response
     """
     start_time = datetime.now(timezone.utc)
 
@@ -445,61 +495,71 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Combine all questions
         all_questions = questions_en + questions_zh
 
-        # Save to S3
-        success, output_file = save_to_s3(all_questions, start_time)
+        # Process questions in database
+        processed_count = 0
+        for question in all_questions:
+            success, _ = process_question(question)
+            if success:
+                processed_count += 1
 
-        execution_info = {
-            "total_questions": len(all_questions),
+        # Save to S3
+        s3_success, output_file = save_to_s3(all_questions, start_time)
+
+        # Record execution
+        execution_data = {
+            "start_time": start_time,
+            "end_time": datetime.now(timezone.utc),
+            "questions_processed": processed_count,
             "english_questions": len(questions_en),
             "chinese_questions": len(questions_zh),
-            "output_file": output_file,
-            "status": "success" if success else "error",
+            "status": "success" if s3_success else "error",
             "duration_ms": int(
                 (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             ),
+            "output_file": output_file,
         }
 
-        # Update execution log
-        update_execution_log(execution_info)
+        crawler_executions_repo.create(execution_data)
 
-        if success:
-            return {
-                "statusCode": 200,
-                "body": json.dumps(
-                    {
-                        "message": "Successfully processed and saved questions",
-                        "total_questions": len(all_questions),
-                        "english_questions": len(questions_en),
-                        "chinese_questions": len(questions_zh),
-                        "output_file": output_file,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "duration_ms": execution_info["duration_ms"],
-                    }
-                ),
-            }
-        else:
-            return {
-                "statusCode": 500,
-                "body": json.dumps({"error": "Failed to save questions to S3"}),
-            }
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {
+                    "message": "Successfully processed and saved questions",
+                    "total_questions": len(all_questions),
+                    "processed_questions": processed_count,
+                    "english_questions": len(questions_en),
+                    "chinese_questions": len(questions_zh),
+                    "output_file": output_file,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "duration_ms": execution_data["duration_ms"],
+                }
+            ),
+        }
 
     except Exception as e:
         error_message = str(e)
         logger.error("Unexpected error in lambda_handler: %s", error_message)
 
-        # Update execution log with error
-        execution_info = {
-            "total_questions": 0,
+        # Record error execution
+        execution_data = {
+            "start_time": start_time,
+            "end_time": datetime.now(timezone.utc),
+            "questions_processed": 0,
             "english_questions": 0,
             "chinese_questions": 0,
-            "output_file": "",
             "status": "error",
             "error_message": error_message,
             "duration_ms": int(
                 (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             ),
+            "output_file": "",
         }
-        update_execution_log(execution_info)
+
+        try:
+            crawler_executions_repo.create(execution_data)
+        except Exception as ex:
+            logger.error("Failed to record error execution: %s", str(ex))
 
         return {
             "statusCode": 500,
