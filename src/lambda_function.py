@@ -76,8 +76,10 @@ QUESTION_TYPES = {
 # Environment variables
 S3_BUCKET = os.environ["S3_BUCKET"]
 S3_PREFIX = os.environ.get("S3_PREFIX", "repost-questions/")
-USER_AGENT = os.environ["USER_AGENT"]
-
+USER_AGENT = os.environ.get(
+    "USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+)
 # Initialize S3 client
 try:
     s3_client = boto3.client("s3")
@@ -425,51 +427,45 @@ def save_to_s3(
         logger.warning("No questions to save")
         return False, ""
 
-    try:
-        # Create filename with timestamp
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"{S3_PREFIX}questions_{timestamp}.json"
+    # Create filename with timestamp
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"{S3_PREFIX}questions_{timestamp}.json"
 
-        # Create metadata
-        metadata = {
-            "question_count": len(questions),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "source_urls": [REPOST_URL, REPOST_URL_ZH],
-            "en_count": sum(1 for q in questions if q["language"] == "en"),
-            "zh_count": sum(1 for q in questions if q["language"] == "zh-Hant"),
-            "tags": list(
-                set(tag for question in questions for tag in question.get("tags", []))
-            ),
-            "questions_with_accepted_answers": sum(
-                1 for q in questions if q.get("has_accepted_answer", False)
-            ),
-            "execution_duration_ms": int(
-                (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-            ),
-        }
+    # Create metadata
+    metadata = {
+        "question_count": len(questions),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source_urls": [REPOST_URL, REPOST_URL_ZH],
+        "en_count": sum(1 for q in questions if q["language"] == "en"),
+        "zh_count": sum(1 for q in questions if q["language"] == "zh-Hant"),
+        "tags": list(
+            set(tag for question in questions for tag in question.get("tags", []))
+        ),
+        "questions_with_accepted_answers": sum(
+            1 for q in questions if q.get("has_accepted_answer", False)
+        ),
+        "execution_duration_ms": int(
+            (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        ),
+    }
 
-        # Create final data structure
-        data = {"metadata": metadata, "questions": questions}
+    data = {"metadata": metadata, "questions": questions}
 
-        # Upload to S3
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=filename,
-            Body=json.dumps(data, ensure_ascii=False, indent=2),
-            ContentType="application/json",
-        )
+    # Upload to S3 - let any ClientError propagate up
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=filename,
+        Body=json.dumps(data, ensure_ascii=False, indent=2),
+        ContentType="application/json",
+    )
 
-        logger.info(
-            "Successfully saved %d questions to s3://%s/%s",
-            len(questions),
-            S3_BUCKET,
-            filename,
-        )
-        return True, filename
-
-    except Exception as e:
-        logger.error("Unexpected error saving to S3: %s", str(e))
-        return False, ""
+    logger.info(
+        "Successfully saved %d questions to s3://%s/%s",
+        len(questions),
+        S3_BUCKET,
+        filename,
+    )
+    return True, filename
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -502,8 +498,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             if success:
                 processed_count += 1
 
-        # Save to S3
-        s3_success, output_file = save_to_s3(all_questions, start_time)
+        # Save to S3 - will raise exception if fails
+        _, output_file = save_to_s3(all_questions, start_time)
 
         # Record execution
         execution_data = {
@@ -512,7 +508,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "questions_processed": processed_count,
             "english_questions": len(questions_en),
             "chinese_questions": len(questions_zh),
-            "status": "success" if s3_success else "error",
+            "status": "success",
             "duration_ms": int(
                 (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
             ),
@@ -561,9 +557,4 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         except Exception as ex:
             logger.error("Failed to record error execution: %s", str(ex))
 
-        return {
-            "statusCode": 500,
-            "body": json.dumps(
-                {"error": "Internal server error", "message": error_message}
-            ),
-        }
+        raise  # Re-raise the exception to trigger Lambda failure
